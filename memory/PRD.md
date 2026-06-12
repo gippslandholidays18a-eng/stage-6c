@@ -31,8 +31,8 @@ porting plan documented at handoff.
 | 5 | ✅ 2026-02 | Campaign engine — 13 audiences across 3 tabs, configurable offer library (12 defaults), content recommendations, direct booking growth tracker, audience CSV exports |
 | 6A | ✅ 2026-02 | Auth foundation — self-hosted JWT + bcrypt, three roles (admin/manager/staff), /login page, /admin/users CRUD, role-based sidebar, session restore via /api/auth/me, seed admin (`admin@sourcebench.local`) |
 | 6B | ✅ 2026-02 | Property model extension (address, key/wifi/parking/lock, cleaner+manager assignees, occupancy, check-in/out times, OTA listing URLs) + Task management (`/tasks` with 8 categories, 4 statuses, 4 priorities, checklists, comments, base64 photos via browser-image-compression, RBAC: admin/manager full CRUD, staff read assigned-property tasks + complete only own) |
-| 6C | P0 Next | Compliance & Housekeeping schedules per property — auto-update on linked task completion |
-| 6D | P1 | Apartment inventory tracker (default stock limits seeded per property) |
+| 6C | ✅ 2026-02 | Compliance & housekeeping schedules — 12 default items per property (6 compliance + 6 housekeeping), auto-seeds for every property on startup, `/compliance` portfolio page + per-property panel in Properties editor, mark-done bumps `next_due_at`, auto-creates linked tasks within 14-day lead window (assignee = cleaner for housekeeping / manager for compliance), and task completion automatically advances the linked schedule via explicit `schedule_item_id` OR category+subtype+property fallback |
+| 6D | P1 Next | Apartment inventory tracker (default stock limits seeded per property) |
 | 6E | P1 | Guest review tracker — manual entry, CSV import, analytics, priority flags, linked to `/guests/{id}` |
 | 7 | Backlog | Staff calendar |
 | ∞ | Backlog | PMS-agnostic inbox + webhook receiver (Guesty/Hospitable/Hostaway), Postgres/Vercel port |
