@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Any, Dict
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 import pandas as pd
 
@@ -86,6 +86,13 @@ from task_service import (
     summarize as task_summarize,
     now_iso as task_now_iso,
     new_id as task_new_id,
+)
+from compliance_service import (
+    COMPLIANCE_DEFAULTS, HOUSEKEEPING_DEFAULTS, DEFAULT_LEAD_DAYS,
+    build_item as build_schedule_item,
+    default_items_for_property,
+    status_for_item, bump_after_completion, needs_task, task_priority_for,
+    summarise as schedule_summarise,
 )
 
 ROOT_DIR = Path(__file__).parent
@@ -1477,6 +1484,17 @@ async def startup_seed():
         await db.tasks.create_index("property_id")
         await db.tasks.create_index("assignee_id")
         await db.tasks.create_index("status")
+        await db.schedule_items.create_index("property_id")
+        await db.schedule_items.create_index([("kind", 1), ("subtype", 1)])
+        await db.schedule_items.create_index("next_due_at")
+        # Auto-seed default schedule items onto any property that doesn't have any yet.
+        async for prop in db.properties.find({}, {"_id": 0, "id": 1, "name": 1}):
+            exists = await db.schedule_items.find_one({"property_id": prop["id"]}, {"_id": 1})
+            if exists:
+                continue
+            items = default_items_for_property(prop["id"], prop.get("name", ""))
+            if items:
+                await db.schedule_items.insert_many([it.copy() for it in items])
     except Exception as e:
         logger.exception("startup seed failed: %s", e)
 
@@ -1641,6 +1659,8 @@ class TaskCreate(BaseModel):
     property_id: Optional[str] = None
     assignee_id: Optional[str] = None
     checklist: Optional[List[str]] = None
+    schedule_item_id: Optional[str] = None
+    schedule_subtype: Optional[str] = None
 
 
 class TaskUpdate(BaseModel):
@@ -1652,6 +1672,8 @@ class TaskUpdate(BaseModel):
     due_date: Optional[str] = None
     property_id: Optional[str] = None
     assignee_id: Optional[str] = None
+    schedule_item_id: Optional[str] = None
+    schedule_subtype: Optional[str] = None
 
 
 class PhotoCreate(BaseModel):
@@ -1784,8 +1806,16 @@ async def tasks_create(
         created_by=actor["id"],
         created_by_name=actor.get("name") or actor.get("email", ""),
         checklist_items=payload.checklist or [],
+        schedule_item_id=payload.schedule_item_id,
+        schedule_subtype=payload.schedule_subtype,
     )
     await db.tasks.insert_one(doc.copy())
+    # Mirror the linkage onto the schedule item (so the UI can show "open task" badge)
+    if payload.schedule_item_id:
+        await db.schedule_items.update_one(
+            {"id": payload.schedule_item_id},
+            {"$set": {"linked_task_id": doc["id"], "updated_at": task_now_iso()}},
+        )
     doc.pop("_id", None)
     return doc
 
@@ -1849,11 +1879,48 @@ async def tasks_update(
         aid, aname = await _resolve_assignee(data["assignee_id"])
         patch["assignee_id"] = aid
         patch["assignee_name"] = aname
+    if "schedule_item_id" in data:
+        patch["schedule_item_id"] = data["schedule_item_id"] or None
+    if "schedule_subtype" in data:
+        patch["schedule_subtype"] = data["schedule_subtype"] or None
 
     patch["updated_at"] = task_now_iso()
     await db.tasks.update_one({"id": tid}, {"$set": patch})
+
+    # If status flipped to 'done', try to bump a linked schedule item.
+    if patch.get("status") == "done":
+        await _maybe_bump_schedule_for_task(task, patch, user)
+
     doc = await db.tasks.find_one({"id": tid}, {"_id": 0})
     return doc
+
+
+async def _maybe_bump_schedule_for_task(
+    prev_task: Dict[str, Any],
+    patch: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> None:
+    """Advance the matching schedule item when a task is completed."""
+    sid = prev_task.get("schedule_item_id")
+    item = None
+    if sid:
+        item = await db.schedule_items.find_one({"id": sid}, {"_id": 0})
+    if not item:
+        # Fallback: category + subtype + property match.
+        subtype = prev_task.get("schedule_subtype")
+        pid = prev_task.get("property_id")
+        cat = prev_task.get("category")
+        if subtype and pid and cat in ("compliance", "housekeeping"):
+            item = await db.schedule_items.find_one(
+                {"property_id": pid, "kind": cat, "subtype": subtype},
+                {"_id": 0},
+            )
+    if not item:
+        return
+    completed_at = patch.get("completed_at") or task_now_iso()
+    actor_name = actor.get("name") or actor.get("email", "")
+    set_patch = bump_after_completion(item, completed_at, actor_name)
+    await db.schedule_items.update_one({"id": item["id"]}, {"$set": set_patch})
 
 
 @api.delete("/tasks/{tid}")
@@ -1861,9 +1928,15 @@ async def tasks_delete(
     tid: str,
     _: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
 ):
+    task = await db.tasks.find_one({"id": tid}, {"_id": 0, "schedule_item_id": 1})
     res = await db.tasks.delete_one({"id": tid})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not found")
+    if task and task.get("schedule_item_id"):
+        await db.schedule_items.update_one(
+            {"id": task["schedule_item_id"], "linked_task_id": tid},
+            {"$set": {"linked_task_id": None, "updated_at": task_now_iso()}},
+        )
     return {"deleted": True}
 
 
@@ -2001,6 +2074,249 @@ async def task_comment_add(
         {"$push": {"comments": c}, "$set": {"updated_at": task_now_iso()}},
     )
     return c
+
+
+# --- Stage 6C — Compliance & Housekeeping schedules --------------------------
+
+class ScheduleItemCreate(BaseModel):
+    property_id: str
+    kind: str  # "compliance" | "housekeeping"
+    subtype: str
+    label: str
+    cadence_days: int
+    last_done_at: Optional[str] = None
+    notes: Optional[str] = ""
+    auto_task_lead_days: Optional[int] = None
+
+
+class ScheduleItemUpdate(BaseModel):
+    label: Optional[str] = None
+    cadence_days: Optional[int] = None
+    last_done_at: Optional[str] = None
+    next_due_at: Optional[str] = None
+    notes: Optional[str] = None
+    active: Optional[bool] = None
+    auto_task_lead_days: Optional[int] = None
+
+
+async def _auto_create_tasks_for_schedules(actor: Dict[str, Any]) -> int:
+    """Find schedule items whose next_due_at is inside the lead window with no
+    open task, and create one. Returns the number of tasks newly created."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    cursor = db.schedule_items.find(
+        {"active": True, "linked_task_id": None},
+        {"_id": 0},
+    )
+    items = await cursor.to_list(length=2000)
+    created = 0
+    for item in items:
+        if not needs_task(item, today):
+            continue
+        # Resolve assignee: cleaner for housekeeping, manager for compliance.
+        prop = await db.properties.find_one({"id": item["property_id"]}, {"_id": 0})
+        if not prop:
+            continue
+        assignee_id = None
+        if item["kind"] == "housekeeping":
+            assignee_id = prop.get("cleaner_user_id") or prop.get("manager_user_id")
+        else:
+            assignee_id = prop.get("manager_user_id") or prop.get("cleaner_user_id")
+        assignee_name = ""
+        if assignee_id:
+            u = await db.users.find_one({"id": assignee_id, "active": True}, {"_id": 0, "name": 1, "email": 1})
+            if u:
+                assignee_name = u.get("name") or u.get("email", "")
+            else:
+                assignee_id = None
+        title = f"{item['label']} — {item.get('property_name') or prop.get('name', '')}"
+        priority = task_priority_for(item, today)
+        doc = build_task_doc(
+            title=title,
+            description=(item.get("notes") or "") + ("\n\nAuto-generated from schedule." if item.get("notes") else "Auto-generated from schedule."),
+            category=item["kind"],
+            priority=priority,
+            status="open",
+            due_date=item.get("next_due_at"),
+            property_id=item["property_id"],
+            property_name=item.get("property_name") or prop.get("name", ""),
+            assignee_id=assignee_id,
+            assignee_name=assignee_name,
+            created_by=actor["id"],
+            created_by_name=actor.get("name") or actor.get("email", "system"),
+            schedule_item_id=item["id"],
+            schedule_subtype=item.get("subtype"),
+        )
+        await db.tasks.insert_one(doc.copy())
+        await db.schedule_items.update_one(
+            {"id": item["id"]},
+            {"$set": {"linked_task_id": doc["id"], "updated_at": task_now_iso()}},
+        )
+        created += 1
+    return created
+
+
+@api.get("/schedules/meta")
+async def schedules_meta(_: Dict[str, Any] = Depends(current_user_dep)):
+    return {
+        "compliance_defaults": COMPLIANCE_DEFAULTS,
+        "housekeeping_defaults": HOUSEKEEPING_DEFAULTS,
+        "default_lead_days": DEFAULT_LEAD_DAYS,
+    }
+
+
+@api.get("/schedules")
+async def schedules_list(
+    property_id: Optional[str] = None,
+    kind: Optional[str] = None,
+    status: Optional[str] = None,
+    user: Dict[str, Any] = Depends(current_user_dep),
+):
+    # Auto-sync open tasks on every list call. Cheap for small portfolios and
+    # avoids running a background worker.
+    if user.get("role") in ("admin", "manager"):
+        await _auto_create_tasks_for_schedules(user)
+
+    q: Dict[str, Any] = {}
+    if user.get("role") == "staff":
+        q["property_id"] = {"$in": user.get("assigned_properties") or ["__none__"]}
+    if property_id:
+        q["property_id"] = property_id
+    if kind:
+        q["kind"] = kind
+    cursor = db.schedule_items.find(q, {"_id": 0}).sort([("kind", 1), ("label", 1)])
+    items = await cursor.to_list(length=5000)
+    today = datetime.now(timezone.utc).date().isoformat()
+    enriched = []
+    for it in items:
+        it_status = status_for_item(it, today)
+        if status and it_status != status:
+            continue
+        it["status"] = it_status
+        enriched.append(it)
+    summary = schedule_summarise(items)
+    return {"items": enriched, "summary": summary}
+
+
+@api.post("/schedules")
+async def schedules_create(
+    payload: ScheduleItemCreate,
+    actor: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
+):
+    prop = await db.properties.find_one({"id": payload.property_id}, {"_id": 0, "id": 1, "name": 1})
+    if not prop:
+        raise HTTPException(status_code=400, detail="Unknown property")
+    if payload.kind not in ("compliance", "housekeeping"):
+        raise HTTPException(status_code=400, detail="kind must be compliance or housekeeping")
+    if payload.cadence_days <= 0:
+        raise HTTPException(status_code=400, detail="cadence_days must be > 0")
+    item = build_schedule_item(
+        property_id=prop["id"], property_name=prop.get("name", ""),
+        kind=payload.kind, subtype=payload.subtype.strip(),
+        label=payload.label.strip(), cadence_days=payload.cadence_days,
+        last_done_at=payload.last_done_at, notes=payload.notes or "",
+        lead_days=payload.auto_task_lead_days or DEFAULT_LEAD_DAYS,
+    )
+    await db.schedule_items.insert_one(item.copy())
+    item.pop("_id", None)
+    return item
+
+
+@api.put("/schedules/{sid}")
+async def schedules_update(
+    sid: str,
+    payload: ScheduleItemUpdate,
+    _: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
+):
+    item = await db.schedule_items.find_one({"id": sid}, {"_id": 0})
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    data = payload.model_dump(exclude_unset=True)
+    patch: Dict[str, Any] = {}
+    if "label" in data and data["label"]:
+        patch["label"] = data["label"].strip()
+    if "cadence_days" in data and data["cadence_days"]:
+        if data["cadence_days"] <= 0:
+            raise HTTPException(status_code=400, detail="cadence_days must be > 0")
+        patch["cadence_days"] = int(data["cadence_days"])
+    if "notes" in data:
+        patch["notes"] = (data["notes"] or "").strip()
+    if "active" in data and data["active"] is not None:
+        patch["active"] = bool(data["active"])
+    if "auto_task_lead_days" in data and data["auto_task_lead_days"]:
+        patch["auto_task_lead_days"] = int(data["auto_task_lead_days"])
+    if "last_done_at" in data:
+        patch["last_done_at"] = data["last_done_at"] or None
+        cadence = int(patch.get("cadence_days") or item.get("cadence_days") or 365)
+        # Recompute next_due_at unless caller provides one explicitly.
+        if "next_due_at" not in data:
+            base = data["last_done_at"] or datetime.now(timezone.utc).date().isoformat()
+            patch["next_due_at"] = (datetime.fromisoformat(base).date() + timedelta(days=cadence)).isoformat()
+    if "next_due_at" in data:
+        patch["next_due_at"] = data["next_due_at"] or None
+    patch["updated_at"] = task_now_iso()
+    await db.schedule_items.update_one({"id": sid}, {"$set": patch})
+    doc = await db.schedule_items.find_one({"id": sid}, {"_id": 0})
+    doc["status"] = status_for_item(doc)
+    return doc
+
+
+@api.delete("/schedules/{sid}")
+async def schedules_delete(
+    sid: str,
+    _: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
+):
+    res = await db.schedule_items.delete_one({"id": sid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"deleted": True}
+
+
+@api.post("/schedules/{sid}/mark-done")
+async def schedules_mark_done(
+    sid: str,
+    actor: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
+):
+    item = await db.schedule_items.find_one({"id": sid}, {"_id": 0})
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    actor_name = actor.get("name") or actor.get("email", "")
+    set_patch = bump_after_completion(item, datetime.now(timezone.utc).date().isoformat(), actor_name)
+    # Also close any linked open task gracefully (mark it done).
+    if item.get("linked_task_id"):
+        await db.tasks.update_one(
+            {"id": item["linked_task_id"]},
+            {"$set": {
+                "status": "done",
+                "completed_at": task_now_iso(),
+                "completed_by": actor["id"],
+                "completed_by_name": actor_name,
+                "updated_at": task_now_iso(),
+            }},
+        )
+    await db.schedule_items.update_one({"id": sid}, {"$set": set_patch})
+    doc = await db.schedule_items.find_one({"id": sid}, {"_id": 0})
+    doc["status"] = status_for_item(doc)
+    return doc
+
+
+@api.post("/schedules/seed-defaults")
+async def schedules_seed_defaults(
+    property_id: str,
+    _: Dict[str, Any] = Depends(require_role_dep("admin", "manager")),
+):
+    prop = await db.properties.find_one({"id": property_id}, {"_id": 0, "id": 1, "name": 1})
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+    existing = await db.schedule_items.find(
+        {"property_id": property_id},
+        {"_id": 0, "kind": 1, "subtype": 1},
+    ).to_list(length=500)
+    existing_keys = {(e["kind"], e["subtype"]) for e in existing}
+    items = default_items_for_property(prop["id"], prop.get("name", ""))
+    to_insert = [it for it in items if (it["kind"], it["subtype"]) not in existing_keys]
+    if to_insert:
+        await db.schedule_items.insert_many([it.copy() for it in to_insert])
+    return {"inserted": len(to_insert), "skipped": len(items) - len(to_insert)}
 
 
 MANAGED_PROPERTIES = [

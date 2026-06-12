@@ -1,7 +1,7 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Upload, Table2, Building2, History, Users, AlertTriangle,
-  Sparkles, Settings, FileDown, Mail, Megaphone, Tag, Shield, LogOut, CheckSquare,
+  Sparkles, Settings, FileDown, Mail, Megaphone, Tag, Shield, LogOut, CheckSquare, ShieldCheck,
 } from "lucide-react";
 import { Toaster } from "sonner";
 import { useAuth, hasRole } from "@/context/AuthContext";
@@ -10,6 +10,7 @@ import { useAuth, hasRole } from "@/context/AuthContext";
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard", end: true, roles: ["admin", "manager", "staff"] },
   { to: "/tasks", label: "Tasks", icon: CheckSquare, testid: "nav-tasks", roles: ["admin", "manager", "staff"] },
+  { to: "/compliance", label: "Compliance", icon: ShieldCheck, testid: "nav-compliance", roles: ["admin", "manager"] },
   { to: "/reservations", label: "Reservations", icon: Table2, testid: "nav-reservations", roles: ["admin", "manager"] },
   { to: "/segments", label: "Segments", icon: Users, testid: "nav-segments", roles: ["admin", "manager"] },
   { to: "/scores", label: "Scores", icon: Sparkles, testid: "nav-scores", roles: ["admin", "manager"] },

@@ -20,6 +20,7 @@ import DigestSettings from "@/pages/DigestSettings";
 import Campaigns from "@/pages/Campaigns";
 import OffersSettings from "@/pages/OffersSettings";
 import Tasks from "@/pages/Tasks";
+import Compliance from "@/pages/Compliance";
 
 function App() {
   return (
@@ -45,6 +46,7 @@ function App() {
                 <Route path="reports" element={<Reports />} />
                 <Route path="campaigns" element={<Campaigns />} />
                 <Route path="tasks" element={<Tasks />} />
+                <Route path="compliance" element={<Compliance />} />
 
                 {/* Admin-only nested routes */}
                 <Route element={<ProtectedRoute roles={["admin"]} />}>

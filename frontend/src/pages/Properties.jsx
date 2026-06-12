@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Trash2, Plus, Building2, Pencil, Save, X, ChevronDown, ChevronRight } from "lucide-react";
+import PropertySchedulePanel from "@/components/PropertySchedulePanel";
 
 const TYPES = ["Apartment", "House", "Townhouse", "Studio", "Villa", "Cabin", "Other"];
 
@@ -219,6 +220,7 @@ export default function Properties() {
                           draft={editDraft}
                           setDraft={setEditDraft}
                           users={users}
+                          propertyId={p.id}
                           onSave={() => saveEdit(p.id)}
                           onCancel={() => { setEditingId(null); setEditDraft(null); }}
                           mode="edit"
@@ -271,11 +273,12 @@ export default function Properties() {
   );
 }
 
-function PropertyEditor({ draft, setDraft, users, onSave, onCancel, mode }) {
+function PropertyEditor({ draft, setDraft, users, propertyId, onSave, onCancel, mode }) {
   const set = (patch) => setDraft({ ...draft, ...patch });
   const setOta = (patch) => setDraft({ ...draft, ota_listings: { ...(draft.ota_listings || {}), ...patch } });
   const [showAccess, setShowAccess] = useState(mode === "edit");
   const [showListings, setShowListings] = useState(false);
+  const [showSchedule, setShowSchedule] = useState(false);
   return (
     <div className="surface rounded-md p-5 space-y-3" data-testid={`property-editor-${mode}`}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -552,6 +555,25 @@ function PropertyEditor({ draft, setDraft, users, onSave, onCancel, mode }) {
           <Save className="w-4 h-4" /> {mode === "edit" ? "Save changes" : "Add property"}
         </button>
       </div>
+
+      {/* Schedule (only when editing an existing property) */}
+      {mode === "edit" && propertyId && (
+        <div className="border-t divider pt-3">
+          <button
+            onClick={() => setShowSchedule((s) => !s)}
+            data-testid="prop-toggle-schedule"
+            className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-[0.18em] text-dim hover:text-white"
+          >
+            {showSchedule ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            Compliance &amp; housekeeping schedule
+          </button>
+          {showSchedule && (
+            <div className="mt-3">
+              <PropertySchedulePanel propertyId={propertyId} />
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
